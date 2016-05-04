@@ -123,7 +123,7 @@ class UrlDecoder extends EncodeDecoderBase {
 	 * @return void
 	 */
 	public function decodeUrl(array $params) {
-		if ($this->isProperTsfe()) {
+		if ($this->canDecoderExecute()) {
 			$this->caller = $params['pObj'];
 
 			$this->initialize();
@@ -153,13 +153,7 @@ class UrlDecoder extends EncodeDecoderBase {
 	 * @return void
 	 */
 	protected function calculateChash(UrlCacheEntry $cacheEntry) {
-		$requestVariables = $_GET;
-		$decodeVariables = array();
-
-		parse_str(substr(GeneralUtility::implodeArrayForUrl('', $cacheEntry->getRequestVariables()), 1), $decodeVariables);
-
-		ArrayUtility::mergeRecursiveWithOverrule($requestVariables, $decodeVariables);
-
+		$requestVariables = $cacheEntry->getRequestVariables();
 		$cacheHashCalculator = GeneralUtility::makeInstance('TYPO3\\CMS\\Frontend\\Page\\CacheHashCalculator');
 		/* @var \TYPO3\CMS\Frontend\Page\CacheHashCalculator $cacheHashCalculator */
 		$cHashParameters = $cacheHashCalculator->getRelevantParameters(GeneralUtility::implodeArrayForUrl('', $requestVariables));
@@ -186,6 +180,15 @@ class UrlDecoder extends EncodeDecoderBase {
 				GeneralUtility::callUserFunction($userFunc, $hookParams, $this);
 			}
 		}
+	}
+
+	/**
+	 * Checks if the decoder can execute.
+	 *
+	 * @return bool
+	 */
+	protected function canDecoderExecute() {
+		return $this->isProperTsfe() && !$this->isInWorkspace();
 	}
 
 	/**
@@ -292,22 +295,35 @@ class UrlDecoder extends EncodeDecoderBase {
 	protected function createPathCacheEntry($segment, array $pages, array &$shortcutPages) {
 		$result = NULL;
 		foreach ($pages as $page) {
+			$originalMountPointPid = 0;
 			if ($page['doktype'] == PageRepository::DOKTYPE_SHORTCUT) {
 				// Value is not relevant, key is!
 				$shortcutPages[$page['uid']] = true;
+			}
+			while ($page['doktype'] == PageRepository::DOKTYPE_MOUNTPOINT && $page['mount_pid_ol'] == 1) {
+				$originalMountPointPid = $page['uid'];
+				$page = $this->pageRepository->getPage($page['mount_pid']);
+				if (!is_array($page)) {
+					$this->tsfe->pageNotFoundAndExit('[realurl] Broken mount point at page with uid=' . $originalMountPointPid);
+				}
 			}
 			if ($this->detectedLanguageId > 0 && !isset($page['_PAGES_OVERLAY'])) {
 				$page = $this->pageRepository->getPageOverlay($page, (int)$this->detectedLanguageId);
 			}
 			foreach (self::$pageTitleFields as $field) {
-				if ($this->utility->convertToSafeString($page[$field], $this->separatorCharacter) == $segment) {
+				if (isset($page[$field]) && $page[$field] !== '' && $this->utility->convertToSafeString($page[$field], $this->separatorCharacter) === $segment) {
 					$result = GeneralUtility::makeInstance('DmitryDulepov\\Realurl\\Cache\\PathCacheEntry');
 					/** @var \DmitryDulepov\Realurl\Cache\PathCacheEntry $result */
 					$result->setPageId((int)$page['uid']);
 					if ($this->mountPointVariable !== '') {
 						$result->setMountPoint($this->mountPointVariable);
 					}
-					if ((int)$page['doktype'] === PageRepository::DOKTYPE_MOUNTPOINT) {
+					if ($originalMountPointPid !== 0) {
+						// Mount point with mount_pid_ol==1
+						$this->mountPointVariable = $page['uid'] . '-' . $originalMountPointPid;
+						// No $this->mountPointStartPid here because this is a substituted page
+					}
+					elseif ((int)$page['doktype'] === PageRepository::DOKTYPE_MOUNTPOINT) {
 						$this->mountPointVariable = $page['mount_pid'] . '-' . $page['uid'];
 						$this->mountPointStartPid = (int)$page['mount_pid'];
 					}
@@ -318,30 +334,6 @@ class UrlDecoder extends EncodeDecoderBase {
 
 		return $result;
 	}
-
-	/**
-	 * Creates query string from passed variables.
-	 *
-	 * @param array|null $getVars
-	 * @return string
-	 */
-	protected function createQueryString($getVars) {
-		$queryString = (string)$_SERVER['QUERY_STRING'];
-
-		if (!is_array($getVars) || count($getVars) == 0) {
-			return $queryString;
-		}
-
-		if ($queryString) {
-			$queryStringParameters = array();
-			parse_str($queryString, $queryStringParameters);
-			ArrayUtility::mergeRecursiveWithOverrule($queryStringParameters, $getVars);
-			$getVars = $queryStringParameters;
-		}
-
-		return substr(GeneralUtility::implodeArrayForUrl('', $getVars), 1);
-	}
-
 
 	/**
 	 * Generates a parameter string from an array recursively
@@ -782,9 +774,12 @@ class UrlDecoder extends EncodeDecoderBase {
 	 * @return UrlCacheEntry with only pageId and requestVariables filled in
 	 */
 	protected function doDecoding($path) {
-		// Remember: urldecode(), not rawurldecode()!
-		$path = trim(urldecode($path), '/');
+		$path = trim($path, '/');
 		$pathSegments = $path ? explode('/', $path) : array();
+		// Remember: urldecode(), not rawurldecode()!
+		foreach($pathSegments as $id => $value) {
+			$pathSegments[$id] = urldecode($value);
+		}
 
 		$requestVariables = array();
 
@@ -797,6 +792,8 @@ class UrlDecoder extends EncodeDecoderBase {
 		}
 		ArrayUtility::mergeRecursiveWithOverrule($requestVariables, $this->decodeFixedPostVars($pageId, $pathSegments));
 		ArrayUtility::mergeRecursiveWithOverrule($requestVariables, $this->decodePostVarSets($pageId, $pathSegments));
+
+		$this->mergeWithExistingGetVars($requestVariables);
 
 		$cacheEntry = GeneralUtility::makeInstance('DmitryDulepov\\Realurl\\Cache\\UrlCacheEntry');
 		/** @var \DmitryDulepov\Realurl\Cache\UrlCacheEntry $cacheEntry */
@@ -840,7 +837,7 @@ class UrlDecoder extends EncodeDecoderBase {
 	 * @return UrlCacheEntry|null
 	 */
 	protected function getFromUrlCache($speakingUrl) {
-		return $this->cache->getUrlFromCacheBySpeakingUrl($this->rootPageId, $speakingUrl);
+		return $this->cache->getUrlFromCacheBySpeakingUrl($this->rootPageId, $speakingUrl, $this->detectedLanguageId);
 	}
 
 	/**
@@ -859,6 +856,13 @@ class UrlDecoder extends EncodeDecoderBase {
 
 		while ($newPages) {
 			foreach ($newPages as $page) {
+				while ($page['doktype'] == PageRepository::DOKTYPE_MOUNTPOINT && $page['mount_pid_ol'] == 1) {
+					$originalUid = $page['uid'];
+					$page = $this->pageRepository->getPage($page['mount_pid']);
+					if (!is_array($page)) {
+						$this->tsfe->pageNotFoundAndExit('[realurl] Broken mount point at page with uid=' . $originalUid);
+					}
+				}
 				if ($page['tx_realurl_exclude']) {
 					$ids[] = $page['uid'];
 				}
@@ -952,7 +956,7 @@ class UrlDecoder extends EncodeDecoderBase {
 			$putBack = TRUE;
 			$fileNameSegment = array_pop($urlParts);
 			if ($fileNameSegment && strpos($fileNameSegment, '.') !== FALSE) {
-				if (!$this->handleFileNameMappingToGetVar($fileNameSegment, $getVars)) {
+				if (!$this->handleFileNameMappingToGetVar($fileNameSegment, $getVars, $putBack)) {
 					$validExtensions = array();
 
 					foreach (array('acceptHTMLsuffix', 'defaultToHTMLsuffixOnPrev') as $option) {
@@ -969,8 +973,11 @@ class UrlDecoder extends EncodeDecoderBase {
 						$fileNameSegment = pathinfo($fileNameSegment, PATHINFO_FILENAME);
 					}
 					// If no match, we leave it as is => 404.
-				} else {
-					$putBack = FALSE;
+				}
+				else {
+					if ($putBack && count($urlParts) === 0 && $fileNameSegment === 'index') {
+						$putBack = false;
+					}
 				}
 			}
 			if ($putBack) {
@@ -986,16 +993,30 @@ class UrlDecoder extends EncodeDecoderBase {
 	 *
 	 * @param string $fileNameSegment
 	 * @param array $getVars
+	 * @param bool $putBack
 	 * @return bool
 	 */
-	protected function handleFileNameMappingToGetVar($fileNameSegment, array &$getVars) {
-		$result = FALSE;
+	protected function handleFileNameMappingToGetVar(&$fileNameSegment, array &$getVars, &$putBack) {
+		$result = false;
 		if ($fileNameSegment) {
 			$fileNameConfiguration = $this->configuration->get('fileName/index/' . $fileNameSegment);
 			if (is_array($fileNameConfiguration)) {
-				$result = TRUE;
+				$result = true;
+				$putBack = false;
 				if (isset($fileNameConfiguration['keyValues'])) {
 					$getVars = $fileNameConfiguration['keyValues'];
+				}
+			}
+			else {
+				list($fileName, $extension) = GeneralUtility::revExplode('.', $fileNameSegment, 2);
+				$fileNameConfiguration = $this->configuration->get('fileName/index/.' . $extension);
+				if (is_array($fileNameConfiguration)) {
+					$result = true;
+					$putBack = true;
+					$fileNameSegment = $fileName;
+					if (isset($fileNameConfiguration['keyValues'])) {
+						$getVars = $fileNameConfiguration['keyValues'];
+					}
 				}
 			}
 		}
@@ -1043,8 +1064,7 @@ class UrlDecoder extends EncodeDecoderBase {
 	protected function initialize() {
 		parent::initialize();
 
-		$this->disallowedDoktypes = PageRepository::DOKTYPE_RECYCLER .
-			($this->configuration->get('extconf/enableBadBehavior') ? '' : ',' . PageRepository::DOKTYPE_SPACER);
+		$this->disallowedDoktypes = PageRepository::DOKTYPE_RECYCLER;
 	}
 
 	/**
@@ -1092,7 +1112,7 @@ class UrlDecoder extends EncodeDecoderBase {
 	protected function makeRealPhpArrayFromRequestVars(array $requestVariables) {
 		$result = array();
 
-		parse_str(trim(GeneralUtility::implodeArrayForUrl('', $requestVariables), '&'), $result);
+		parse_str($this->createQueryStringFromParameters($requestVariables), $result);
 		$this->fixBracketsAfterParseStr($result);
 
 		return $result;
@@ -1111,6 +1131,39 @@ class UrlDecoder extends EncodeDecoderBase {
 	}
 
 	/**
+	 * Merges generated request variables with existing $_GET variables. Those in
+	 * $_GET override generated.
+	 *
+	 * @param array $requestVariables
+	 * @return void
+	 */
+	protected function mergeWithExistingGetVars(array &$requestVariables) {
+		if (count($_GET) > 0) {
+			$flatGetArray = $this->parseQueryStringParameters($this->createQueryStringFromParameters($_GET));
+			ArrayUtility::mergeRecursiveWithOverrule($requestVariables, $flatGetArray);
+		}
+	}
+
+	/**
+	 * Parses query string to a set of key/value.
+	 *
+	 * @param string $queryString
+	 * @return array
+	 */
+	protected function parseQueryStringParameters($queryString) {
+		$urlParameters = array();
+
+		$parts = GeneralUtility::trimExplode('&', $queryString, true);
+		foreach ($parts as $part) {
+			list($parameter, $value) = explode('=', $part);
+			// Remember: urldecode(), not rawurldecode()!
+			$urlParameters[urldecode($parameter)] = urldecode($value);
+		}
+
+		return $urlParameters;
+	}
+
+	/**
 	 * Adds data to the path cache. Cache ntry should have page path, language id and page id set.
 	 *
 	 * @param PathCacheEntry $newCacheEntry
@@ -1122,6 +1175,7 @@ class UrlDecoder extends EncodeDecoderBase {
 		if (!$cacheEntry) {
 			$cacheEntry = $newCacheEntry;
 			$cacheEntry->setRootPageId($this->rootPageId);
+			$cacheEntry->setLanguageId($this->detectedLanguageId);
 		}
 		if ($cacheEntry->getExpiration() !== 0) {
 			$cacheEntry->setExpiration(0);
@@ -1142,7 +1196,7 @@ class UrlDecoder extends EncodeDecoderBase {
 			$requestVariables['id'] = $cacheEntry->getPageId();
 			$this->sortArrayDeep($requestVariables);
 
-			$originalUrl = trim(GeneralUtility::implodeArrayForUrl('', $requestVariables), '&');
+			$originalUrl = $this->createQueryStringFromParameters($requestVariables);
 
 			if ($this->canCacheUrl($originalUrl)) {
 				$cacheEntry->setOriginalUrl($originalUrl);
@@ -1346,7 +1400,7 @@ class UrlDecoder extends EncodeDecoderBase {
 		if ($cacheEntry) {
 			$requestVariables = $cacheEntry->getRequestVariables();
 			$requestVariables['id'] = $cacheEntry->getPageId();
-			$_SERVER['QUERY_STRING'] = $this->createQueryString($requestVariables);
+			$_SERVER['QUERY_STRING'] = $this->createQueryStringFromParameters($requestVariables);
 
 			// Setting info in TSFE
 			$this->caller->mergingWithGetVars($this->makeRealPhpArrayFromRequestVars($requestVariables));
@@ -1376,6 +1430,10 @@ class UrlDecoder extends EncodeDecoderBase {
 	 */
 	protected function throw404($errorMessage) {
 		// TODO Write to our own error log here
+
+		// Set language to allow localized error pages
+		$_GET['L'] = $this->detectedLanguageId;
+
 		$this->caller->pageNotFoundAndExit($errorMessage);
 	}
 }

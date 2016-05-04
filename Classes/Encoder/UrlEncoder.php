@@ -449,7 +449,7 @@ class UrlEncoder extends EncodeDecoderBase {
 				}
 			}
 			foreach (self::$pageTitleFields as $field) {
-				if ($page[$field]) {
+				if (isset($page[$field]) && $page[$field] !== '') {
 					$segment = $this->utility->convertToSafeString($page[$field], $this->separatorCharacter);
 					if ($segment === '') {
 						$segment = $this->emptySegmentValue;
@@ -907,7 +907,16 @@ class UrlEncoder extends EncodeDecoderBase {
 				}
 
 				if ($useThisConfiguration) {
-					$this->appendToEncodedUrl($fileName, FALSE);
+
+					if ($fileName{0} === '.') {
+						if ($this->encodedUrl === '') {
+							$this->encodedUrl = 'index';
+						}
+						else {
+							$this->encodedUrl = rtrim($this->encodedUrl, '/');
+						}
+					}
+					$this->encodedUrl .= $fileName;
 					$this->urlParameters = array_diff_key($this->urlParameters, $variablesToRemove);
 					$result = TRUE;
 					break;
@@ -943,19 +952,6 @@ class UrlEncoder extends EncodeDecoderBase {
 	protected function initializeConfiguration() {
 		$this->configuration = GeneralUtility::makeInstance('DmitryDulepov\\Realurl\\Configuration\\ConfigurationReader', ConfigurationReader::MODE_ENCODE, $this->urlParameters);
 		$this->configuration->validate();
-	}
-
-	/**
-	 * Checks if system runs in non-live workspace
-	 *
-	 * @return boolean
-	 */
-	protected function isInWorkspace() {
-		$result = false;
-		if ($this->tsfe->beUserLogin) {
-			$result = ($GLOBALS['BE_USER']->workspace !== 0);
-		}
-		return $result;
 	}
 
 	/**
@@ -1007,7 +1003,7 @@ class UrlEncoder extends EncodeDecoderBase {
 
 		$sortedUrlParameters = $this->urlParameters;
 		$this->sortArrayDeep($sortedUrlParameters);
-		$this->originalUrl = trim(GeneralUtility::implodeArrayForUrl('', $sortedUrlParameters), '&');
+		$this->originalUrl = $this->createQueryStringFromParameters($sortedUrlParameters);
 	}
 
 	/**
@@ -1140,7 +1136,6 @@ class UrlEncoder extends EncodeDecoderBase {
 
 			// Store new alias
 			$insertArray = array(
-				'tstamp' => time(),
 				'tablename' => $configuration['table'],
 				'field_alias' => $configuration['alias_field'],
 				'field_id' => $configuration['id_field'],
